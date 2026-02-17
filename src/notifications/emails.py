@@ -3,14 +3,10 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 import aiosmtplib
-from fastapi import Depends
 from jinja2 import Environment, FileSystemLoader
 
 from exceptions import BaseEmailError
 from notifications.interfaces import EmailSenderInterface
-
-# from config.dependencies import get_settings
-from config.settings import BaseAppSettings
 
 
 class EmailSender(EmailSenderInterface):

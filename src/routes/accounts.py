@@ -8,7 +8,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
-from config import get_jwt_auth_manager, get_settings, BaseAppSettings, get_accounts_email_notificator
+from config import get_jwt_auth_manager, get_settings, BaseAppSettings, get_accounts_email_notificator, get_s3_storage_client
 from storages.interfaces import S3StorageInterface
 from database import (
     get_db,
@@ -57,6 +57,8 @@ async def get_current_user_payload(
 
     try:
         payload = jwt_manager.decode_access_token(token)
+    except jwt_manager.decode_access_token(token):
+        raise HTTPException(401, "Token has expired.")
     except Exception:
         raise HTTPException(401, "Invalid token.")
 
@@ -258,7 +260,7 @@ async def activate_account(
 
     user.is_active = True
     background_tasks.add_task(
-        email_sender.send_activation_email,
+        email_sender.send_activation_complete_email,
         str(user.email),
         activ_link
     )
@@ -657,7 +659,6 @@ async def refresh_access_token(
     status_code=status.HTTP_201_CREATED,
 )
 async def create_profile(
-    s3_client: S3StorageInterface,
     user_id: int,
     first_name: str = Form(...),
     last_name: str = Form(...),
@@ -666,12 +667,13 @@ async def create_profile(
     info: str = Form(...),
     avatar: UploadFile | None = File(None),
     db: AsyncSession = Depends(get_db),
-    jwt_manager: JWTAuthManagerInterface = Depends(),
-    authorization: str | None = Depends(lambda: None),
+    jwt_manager: JWTAuthManagerInterface = Depends(get_jwt_auth_manager),
+    s3_client: S3StorageInterface = Depends(get_s3_storage_client),
+    authorization: str | None = Depends(get_current_user_payload),
 ):
     # ---------------- TOKEN VALIDATION ----------------
     payload = await get_current_user_payload(authorization, jwt_manager)
-    requester_id = int(payload["sub"])
+    requester_id = payload.get('user_id')
     requester_role = payload.get("role")
 
     # ---------------- AUTHORIZATION ----------------
@@ -713,7 +715,7 @@ async def create_profile(
     )
 
     # ---------------- AVATAR VALIDATION ----------------
-    avatar_url = None
+    file_name = None
 
     if avatar:
         try:
@@ -725,7 +727,9 @@ async def create_profile(
 
         # generate filename
         ext = avatar.filename.split(".")[-1]
-        file_name = f"avatars/{user_id}_{uuid.uuid4().hex}.{ext}"
+        file_name = f"{user_id}_{uuid.uuid4().hex}.{ext}"
+        global file_name
+
 
         # upload
         try:
@@ -744,7 +748,7 @@ async def create_profile(
         gender=schema.gender,
         date_of_birth=schema.date_of_birth,
         info=schema.info,
-        avatar=avatar_url,
+        avatar=s3_client.get_file_url(file_name),
     )
 
     db.add(profile)

@@ -121,7 +121,7 @@ async def test_account_activation(e2e_client, settings, e2e_db_session):
     activated_user = result_user.scalars().first()
     assert activated_user.is_active, f"User {user_email} is not active!"
 
-    mailhog_url = f"http://localhost:{settings.MAILHOG_API_PORT}/api/v2/messages"
+    mailhog_url = f"http://{settings.EMAIL_HOST}:{settings.MAILHOG_API_PORT}/api/v2/messages"
     async with httpx.AsyncClient() as client:
         mailhog_response = await client.get(mailhog_url)
     assert mailhog_response.status_code == 200, "Failed to fetch emails from MailHog!"
