@@ -19,7 +19,7 @@ from database import (
     PasswordResetTokenModel,
     RefreshTokenModel, UserProfileModel
 )
-from exceptions import BaseSecurityError
+from exceptions import BaseSecurityError, TokenExpiredError
 from notifications import EmailSenderInterface
 from schemas import (
     UserRegistrationRequestSchema,
@@ -57,7 +57,7 @@ async def get_current_user_payload(
 
     try:
         payload = jwt_manager.decode_access_token(token)
-    except jwt_manager.decode_access_token(token):
+    except TokenExpiredError:
         raise HTTPException(401, "Token has expired.")
     except Exception:
         raise HTTPException(401, "Invalid token.")
@@ -434,7 +434,7 @@ async def reset_password(
         await db.run_sync(lambda s: s.delete(token_record))
 
         background_tasks.add_task(
-            email_sender.send_password_reset_email,
+            email_sender.send_password_reset_complete_email,
             str(user.email),
             complete_reset_link
         )
@@ -728,8 +728,6 @@ async def create_profile(
         # generate filename
         ext = avatar.filename.split(".")[-1]
         file_name = f"{user_id}_{uuid.uuid4().hex}.{ext}"
-        global file_name
-
 
         # upload
         try:
