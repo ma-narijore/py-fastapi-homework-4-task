@@ -1,13 +1,15 @@
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timezone, date
 from typing import cast
 
-from fastapi import APIRouter, Depends, status, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, status, HTTPException, BackgroundTasks, Form, UploadFile, File
 from sqlalchemy import select, delete
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 from config import get_jwt_auth_manager, get_settings, BaseAppSettings, get_accounts_email_notificator
+from storages.interfaces import S3StorageInterface
 from database import (
     get_db,
     UserModel,
@@ -15,7 +17,7 @@ from database import (
     UserGroupEnum,
     ActivationTokenModel,
     PasswordResetTokenModel,
-    RefreshTokenModel
+    RefreshTokenModel, UserProfileModel
 )
 from exceptions import BaseSecurityError
 from notifications import EmailSenderInterface
@@ -31,9 +33,34 @@ from schemas import (
     TokenRefreshRequestSchema,
     TokenRefreshResponseSchema
 )
+from schemas.profiles import ProfileCreateSchema, ProfileResponseSchema
 from security.interfaces import JWTAuthManagerInterface
+from validation import validate_image
+
 
 router = APIRouter()
+
+async def get_current_user_payload(
+    authorization: str | None,
+    jwt_manager: JWTAuthManagerInterface,
+):
+    if not authorization:
+        raise HTTPException(401, "Authorization header is missing")
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            401,
+            "Invalid Authorization header format. Expected 'Bearer <token>'"
+        )
+
+    token = authorization.split(" ")[1]
+
+    try:
+        payload = jwt_manager.decode_access_token(token)
+    except Exception:
+        raise HTTPException(401, "Invalid token.")
+
+    return payload
 
 
 @router.post(
@@ -622,3 +649,106 @@ async def refresh_access_token(
     new_access_token = jwt_manager.create_access_token({"user_id": user_id})
 
     return TokenRefreshResponseSchema(access_token=new_access_token)
+
+
+@router.post(
+    "/users/{user_id}/profile/",
+    response_model=ProfileResponseSchema,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_profile(
+    s3_client: S3StorageInterface,
+    user_id: int,
+    first_name: str = Form(...),
+    last_name: str = Form(...),
+    gender: str = Form(...),
+    date_of_birth: str = Form(...),
+    info: str = Form(...),
+    avatar: UploadFile | None = File(None),
+    db: AsyncSession = Depends(get_db),
+    jwt_manager: JWTAuthManagerInterface = Depends(),
+    authorization: str | None = Depends(lambda: None),
+):
+    # ---------------- TOKEN VALIDATION ----------------
+    payload = await get_current_user_payload(authorization, jwt_manager)
+    requester_id = int(payload["sub"])
+    requester_role = payload.get("role")
+
+    # ---------------- AUTHORIZATION ----------------
+    if requester_id != user_id and requester_role != "admin":
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "You don't have permission to edit this profile."
+        )
+
+    # ---------------- USER CHECK ----------------
+    stmt = select(UserModel).where(UserModel.id == user_id, UserModel.is_active == True)
+    result = await db.execute(stmt)
+    user = result.scalar_one_or_none()
+
+    if not user:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "User not found or not active."
+        )
+
+    # ---------------- PROFILE EXISTS ----------------
+    stmt = select(UserProfileModel).where(UserProfileModel.user_id == user_id)
+    result = await db.execute(stmt)
+    existing_profile = result.scalar_one_or_none()
+
+    if existing_profile:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "User already has a profile."
+        )
+
+    # ---------------- SCHEMA VALIDATION ----------------
+    schema = ProfileCreateSchema(
+        first_name=first_name,
+        last_name=last_name,
+        gender=gender,
+        date_of_birth=date_of_birth,
+        info=info,
+    )
+
+    # ---------------- AVATAR VALIDATION ----------------
+    avatar_url = None
+
+    if avatar:
+        try:
+            await validate_image(avatar)
+        except Exception:
+            raise HTTPException(400, "Invalid avatar image")
+
+        file_bytes = await avatar.read()
+
+        # generate filename
+        ext = avatar.filename.split(".")[-1]
+        file_name = f"avatars/{user_id}_{uuid.uuid4().hex}.{ext}"
+
+        # upload
+        try:
+            await s3_client.upload_file(file_name, file_bytes)
+        except Exception:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to upload avatar. Please try again later."
+            )
+
+    # ---------------- CREATE PROFILE ----------------
+    profile = UserProfileModel(
+        user_id=user_id,
+        first_name=schema.first_name,
+        last_name=schema.last_name,
+        gender=schema.gender,
+        date_of_birth=schema.date_of_birth,
+        info=schema.info,
+        avatar=avatar_url,
+    )
+
+    db.add(profile)
+    await db.commit()
+    await db.refresh(profile)
+
+    return profile
